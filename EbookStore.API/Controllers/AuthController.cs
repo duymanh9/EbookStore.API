@@ -22,71 +22,85 @@ public class AuthController : ControllerBase
     }
 
     [HttpPost("login")]
-    public async Task<IActionResult> Login([FromBody] LoginDto dto)
+public async Task<IActionResult> Login([FromBody] LoginDto dto)
+{
+    var user = await _context.Users.FirstOrDefaultAsync(u => u.Username == dto.Username || u.Email == dto.Username);
+    if (user == null)
+        return Unauthorized("Sai tài khoản hoặc mật khẩu");
+
+    var hash = HashPassword(dto.Password, user.PasswordSalt);
+
+    if (user.PasswordHash != hash)
     {
-        var user = await _context.Users.FirstOrDefaultAsync(u => u.Username == dto.Username);
-        if (user == null)
-            return Unauthorized("Sai tài khoản hoặc mật khẩu");
-
-        var hash = HashPassword(dto.Password, user.PasswordSalt);
-
-        if (user.PasswordHash != hash)
-        {
-            user.FailedLoginAttempts = (user.FailedLoginAttempts ?? 0) + 1;
-            if (user.FailedLoginAttempts > 5) user.IsActive = false;
-
-            _context.Users.Update(user);
-            await _context.SaveChangesAsync();
-
-            return Unauthorized("Sai tài khoản hoặc mật khẩu");
-        }
-        if (user.IsActive == false)
-            return Unauthorized("Tài khoản đã bị khóa");
-
-        /// damg nhap da yeu to MFA -> Multiple factor authen
-        /// viet ham gen OTP -> 6 so : 123456
-        ///  viet ham gui mail, len mail dang ky dich vu gui mail, key_scret
-        ///  gui cho nguoi ta opt Mail.send(user.usermail
-        ///  so sanh cai OTP tren trinh duyet nguoi ta nhap -  bang nhau nhau tiep tuc
-        ///  xeoxeehquogkgqda
-
-
-
-
-        user.LastLoginAt = DateTime.Now;
-        user.FailedLoginAttempts = 0;
+        user.FailedLoginAttempts = (user.FailedLoginAttempts ?? 0) + 1;
+        if (user.FailedLoginAttempts > 5) user.IsActive = false;
 
         _context.Users.Update(user);
         await _context.SaveChangesAsync();
 
-        if (user.TwoFactorEnabled != null && user.TwoFactorEnabled.Value == true)
-        {
-            OTP = GenerateOtp();
-            // Lưu OTP và thời gian hết hạn vào DB hoặc cache (nên dùng DB, không dùng biến toàn cục)
-            user.Otp = OTP; // Tạm lưu vào PasswordSalt (khuyến nghị tạo trường riêng)
-            user.UpdatedAt = DateTime.Now;
-            _context.Users.Update(user);
-            await _context.SaveChangesAsync();
+        return Unauthorized("Sai tài khoản hoặc mật khẩu");
+    }
 
-            await SendOtpEmailAsync(OTP, user.Email);
+    if (user.IsActive == false)
+        return Unauthorized("Tài khoản đã bị khóa");
 
-            return Ok(new
-            {
-                requireOtp = true,
-                tempUser = new { user.Id, user.Username, user.Email }
-            });
-        }
+    if (!user.IsVerified)
+    {
+        // Nếu tài khoản chưa xác minh, gửi lại OTP
+        var otp = GenerateOtp();
+        user.Otp = otp;
+        user.UpdatedAt = DateTime.Now;
 
-        // Trả về thông tin user và role
+        _context.Users.Update(user);
+        await _context.SaveChangesAsync();
+
+        await SendOtpEmailAsync(otp, user.Email);
+
         return Ok(new
         {
-            user.Id,
-            user.Username,
-            user.Avatar,
-            user.Email,
-            user.Role // "admin" hoặc "user"
+            requireOtp = true,
+            message = "Tài khoản chưa xác minh. Vui lòng kiểm tra email để xác minh.",
+            tempUser = new { user.Id, user.Username, user.Email }
         });
     }
+
+    // Nếu bật xác thực 2 lớp (MFA)
+    if (user.TwoFactorEnabled == true)
+    {
+        var otp = GenerateOtp();
+        user.Otp = otp;
+        user.UpdatedAt = DateTime.Now;
+
+        _context.Users.Update(user);
+        await _context.SaveChangesAsync();
+
+        await SendOtpEmailAsync(otp, user.Email);
+
+        return Ok(new
+        {
+            requireOtp = true,
+            message = "Vui lòng nhập mã OTP gửi qua email",
+            tempUser = new { user.Id, user.Username, user.Email }
+        });
+    }
+
+    // Reset trạng thái login
+    user.LastLoginAt = DateTime.Now;
+    user.FailedLoginAttempts = 0;
+    _context.Users.Update(user);
+    await _context.SaveChangesAsync();
+
+    // Nếu không cần OTP thì đăng nhập thành công
+    return Ok(new
+    {
+        user.Id,
+        user.Username,
+        user.Avatar,
+        user.Email,
+        user.Role
+    });
+}
+
 
 
 
@@ -99,6 +113,8 @@ public class AuthController : ControllerBase
         var salt = GenerateSalt();
         var hash = HashPassword(dto.Password, salt);
 
+        var otp = GenerateOtp();
+
         var user = new User
         {
             Username = dto.Username,
@@ -107,11 +123,59 @@ public class AuthController : ControllerBase
             PasswordHash = hash,
             Role = "user", // Mặc định là user
             IsActive = true,
+            IsVerified = false, 
+            Otp = otp,
             CreatedAt = DateTime.Now
         };
         _context.Users.Add(user);
         await _context.SaveChangesAsync();
-        return Ok();
+
+        await SendOtpEmailAsync(otp, user.Email);
+        return Ok( new
+        {
+            requireOtp = true,
+            tempUser = new { user.Id, user.Username, user.Email }
+        });
+    }
+
+    [HttpPost("forgot-password")]
+    public async Task<IActionResult> ForgotForgotPassword([FromBody] ForgotPasswordDto dto)
+    {
+        var user = await _context.Users.FirstOrDefaultAsync(u => u.Email == dto.Email);
+        if (user == null)
+            return BadRequest("Email không tồn tại");
+
+        var otp = GenerateOtp();
+        user.Otp = otp;
+        user.UpdatedAt = DateTime.Now;
+        _context.Users.Update(user);
+        await _context.SaveChangesAsync();
+
+        await SendOtpEmailAsync(otp, user.Email);
+        return Ok(new { 
+            tempUser = new { user.Id, user.Username, user.Email } 
+        });
+    }
+
+    [HttpPost("reset-password")]
+    public async Task<IActionResult> ResetPassword([FromBody] ResetPasswordDto dto)
+    {
+        var user = await _context.Users.FirstOrDefaultAsync(u => u.Id == dto.Id && u.Email == dto.Email);
+        if (user == null)
+            return BadRequest("Không tìm thấy user");
+
+        
+
+        var salt = GenerateSalt();
+        var hash = HashPassword(dto.NewPassword, salt);
+
+        user.PasswordSalt = salt;
+        user.PasswordHash = hash;
+        user.Otp = null;
+        _context.Users.Update(user);
+        await _context.SaveChangesAsync();
+
+        return Ok("Đổi mật khẩu thành công");
     }
 
     [HttpPost("verify-otp")]
@@ -224,6 +288,19 @@ public class AuthController : ControllerBase
 }
 
 // DTOs
+
+public class ForgotPasswordDto
+{
+    public string Email { get; set; }
+}
+
+public class ResetPasswordDto
+{
+    public int Id { get; set; }
+    public string Email { get; set; }
+    public string Otp { get; set; }
+    public string NewPassword { get; set; }
+}
 public class LoginDto
 {
     public string Username { get; set; }

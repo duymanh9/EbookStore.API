@@ -35,6 +35,8 @@ public partial class User
     public string? Role { get; set; }
 
     public string? Otp { get; set; }
+
+    public bool IsVerified { get; set; } = true;
     public virtual ICollection<ChatMessage> ChatMessageReceivers { get; set; } = new List<ChatMessage>();
 
     public virtual ICollection<ChatMessage> ChatMessageSenders { get; set; } = new List<ChatMessage>();
